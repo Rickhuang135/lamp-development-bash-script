@@ -1,0 +1,246 @@
+#!/bin/bash
+
+programename="lamp"
+option=$1
+numberofargs=$#
+configpath="/usr/local/etc/$programename.conf"
+systemdservices=("apache2" "mysql")
+
+findMagento() {
+    file="${1}/bin/magento"
+    if [ -f $file ]; then
+        systemdservices+=("elasticsearch")
+        echo magento module detected under ${1}
+        echo
+    fi
+}
+
+retrieveConfig() {
+    if [ -f $configpath ]; then
+        source $configpath
+        IFS=',' read -r -a inputCssNames <<< "$inputNames"
+        IFS=',' read -r -a outputCssNames <<< "$outputNames"
+    else
+        echo config file not found
+        site="000-default"
+        browser="firefox"
+        inputCssNames=("input.css")
+        outputCssNames=("output.css" "main.css")
+    fi
+    sitetrimed=${site%%'.'*}
+    passed="true"
+    if [ -f "/etc/apache2/sites-available/$site.conf" ]; then
+        echo "apache2 file with top level domain found at"
+        apachesitefile="/etc/apache2/sites-available/$site.conf"
+    elif [ -f "/etc/apache2/sites-available/$sitetrimed.conf" ]; then
+        echo "apache2 file without top level domain found at"
+        apachesitefile="/etc/apache2/sites-available/$sitetrimed.conf"
+        site=$sitetrimed
+    else
+        passed="false"
+    fi
+    if [ "$passed" = "true" ]; then
+        echo $apachesitefile
+        echo
+        local directorytag=$(grep -i "Directory" "$apachesitefile")
+        local prefix=${directorytag%%'"'*}
+        local index=$(( ${#prefix} + 2 ))
+        local directorytagtrimed=$(echo $directorytag | cut -c$index-${#directorytag})
+
+        directory=${directorytagtrimed%%'"'*}
+        if ! test -d $directory; then
+            echo could not locate valid directory in apache2 site configuration file
+            if test -d "/var/www/$sitetrimed"; then
+                directory="var/www/$sitetrimed"
+                echo "using possible directory at $sitetrimed"
+                findMagento $directory
+            else
+                echo "no valid directory located, please check if the <Directory> tag is set corretly in $apachesitefile"
+                exit 1
+            fi
+        else
+            findMagento $directory
+        fi
+    elif [ $numberofargs == 0 ]; then 
+        echo $site not found! make sure appropriet file exists in /etc/apache2/sites-available/ directory, or choose a different domain to open with "$programename config"
+        exit 1
+    elif [[ "$option" == "config" ]]; then
+        echo program is currently broken, site entry requires altering 
+    else
+        echo $site not found! make sure appropriet file exists in /etc/apache2/sites-available/ directory, or choose a different domain to open with "$programename config"
+        exit 1
+    fi
+}
+
+retrieveConfig
+
+starter() {
+    echo "start"
+    echo
+
+    sudo a2ensite "$site.conf"
+    echo  
+
+    for k in "${systemdservices[@]}"
+    do
+        echo "starting ${k}"
+        sudo systemctl start "$k".service
+        echo
+    done
+
+    echo "opening vscode"
+    code $directory
+    echo  
+
+    gnome-terminal -- $programename continue
+}
+
+stopper() {
+    echo "stop"
+    echo
+    sudo a2dissite "$site.conf"
+    echo  
+
+    for k in "${systemdservices[@]}"
+    do
+        echo "stopping ${k}"
+        sudo systemctl stop "$k".service
+        echo
+    done
+
+    echo "killing processes"
+    local stringvaraible=`pgrep -f "$programename"`
+    local ifsparsablestring=`echo "$stringvaraible" | tr '\n' 'a'`
+    IFS='a' read -r -a array <<< "$ifsparsablestring"
+
+    for val in "${array[@]}";
+    do
+        echo "killing process: $val"
+        kill -9 $val
+    done
+    echo
+    echo "complete"
+}
+
+continuew() {
+    cd $directory
+    echo "opening browser"
+    $browser 127.0.0.1/ &
+    echo  
+
+    local findtailwindcss=$(find . -type f -name "tailwind.config.js")
+    if [ -z "$findtailwindcss" ]; then
+        tail -n 100 -f /var/log/apache2/error.log
+    else
+        echo "monitoring server for errors"
+        tail -n 100 -f /var/log/apache2/error.log &
+        echo  
+
+        for i in "${inputCssNames[@]}"
+        do
+            echo "searching for input file $i:"
+            local foundInputpath=`find . -type f -name "$i"`
+            if [ ! -z "$foundInputpath" ]; then
+            
+                local ifsparsablestring=`echo "$foundInputpath" | tr '\n' '+'`
+                IFS='+' read -r -a array <<< "$ifsparsablestring"
+                if [ ${#array[@]} == 1 ]; then
+                    echo "single input path found at ${array[0]}"
+                else
+                    echo "multiple input files found, please remove unnecessary"
+                    for val in "${array[@]}";
+                    do
+                        echo "exists array entry $val"
+                    done
+                    echo "defaulting to first path"
+                fi
+
+                for j in "${outputCssNames[@]}"
+                do
+                    echo "searching for output file $j"
+                    local foundOutputpath=`find . -type f -name "$j"`
+                    if [ ! -z "$foundOutputpath" ]; then
+                        local bah1=`echo "$foundOutputpath" | tr '\n' '+'`
+                        IFS='+' read -r -a array1 <<< "$bah1"
+                        if (( ${#array[@]} > 1 )); then
+                            echo "multiple output files found, this feature is currently not supported and only the first file found will be used"
+                        fi
+                        #build infrastructure in the future to support multiple output files
+                        #currently only the first command will be run.
+                        echo "output path found at ${array1[0]}"
+                        npx tailwindcss -i "${array[0]}" -o "${array1[0]}" --watch
+                    fi
+                done
+                
+                break
+            fi
+            echo  
+        done
+    fi
+
+}
+
+
+test() {
+    echo "this function is for testing purposes"
+
+    for k in "${systemdservices[@]}"
+    do
+        echo "$k"
+        echo
+    done
+}
+
+if [ $# == 0 ]; then
+    if [ -f "/etc/apache2/sites-enabled/$site.conf" ]; then
+        stopper
+    else
+        starter
+    fi
+else
+    case "${option}" in
+        "start")
+            starter
+            ;;
+        "stop")
+            stopper
+            ;;
+        "continue")
+            continuew
+            ;;
+        "test")
+            test
+            ;;
+        "status")
+            if [ -f "/etc/apache2/sites-enabled/$site.conf" ]; then
+                echo apache2 site is enabled
+            else
+                echo apache2 site is dissabled
+            fi
+            echo
+            echo running processes
+            pgrep -f -l "$programename" 
+            echo
+            
+            for k in "${systemdservices[@]}"
+            do
+                sudo systemctl status "$k".service
+                echo
+            done
+            ;;
+        "config")
+            echo "opening configuration file"
+            echo  
+            echo "available domains for apache2:"
+            ls /etc/apache2/sites-available
+            sudoedit /usr/local/etc/$programename.conf
+            ;;
+        *)
+            echo "${option} not recognised"
+            echo "run command without options to automatically turn on and off"
+            echo 'alternatively follow command with "start", "end", "status", or "config"'
+            echo  
+            echo "config  -  opens configuration file"
+            ;;
+    esac
+fi
