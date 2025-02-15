@@ -3,7 +3,8 @@
 programename="lamp"
 option=$1
 numberofargs=$#
-configpath="/usr/local/etc/$programename.conf"
+# configpath="/usr/local/etc/$programename.conf"
+configpath="./$programename.conf"
 systemdservices=("apache2" "mysql")
 
 findMagento() {
@@ -233,7 +234,7 @@ else
             echo  
             echo "available domains for apache2:"
             ls /etc/apache2/sites-available
-            sudoedit /usr/local/etc/$programename.conf
+            sudoedit "$configpath"
             ;;
         *)
             echo "${option} not recognised"
