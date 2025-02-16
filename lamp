@@ -216,10 +216,9 @@ stop_libvirtd () {
     service="libvirtd"
     service_state=$(check_systemd $service)
     if [ "$service_state" = 1 ]; then
-            echo "stopping libvirtd"
+            stop_vm
+            echo stopping libvirtd
             action_function() {
-                stop_vm
-                echo stopping libvirtd
                 sudo systemctl stop libvirtd.socket
                 sudo systemctl stop libvirtd
             }
@@ -246,11 +245,6 @@ stop_libvirtd () {
 # ==============================================================================================================================
 # parameter handlers
 
-test_function () {
-    echo -e "${text_blue}doing test:${text_white}"
-    echo
-    resume_vm
-}
 
 start_function () {
     echo 'lamp start: starts vm and all necessary services, then open appropriet editors, logs and sites'
@@ -259,15 +253,45 @@ start_function () {
     start_vm
 }
 
+continue_function () {
+echo lamp continue: open editors and logs from current terminal
+}
+
+reload_function () {
+    echo reloads apache2 on vm
+}
+
+restart_function () {
+    if [ "$parameter2" = "web" ]; then
+        echo restarts apache2 on vm
+    else
+        echo "reboots vm then start all necessary services"
+    fi
+}
+
 stop_function () {
-    echo "lamp stop: shutdown vm, then close appropriet editors, logs and sites"
-    echo
-    stop_libvirtd
+    if [ "$parameter2" = "vm" ]; then
+            echo shutdown vm host only
+    else
+        echo "lamp stop: shutdown vm, then close appropriet editors, logs and sites"
+        echo
+        stop_libvirtd
+    fi
 }
 
 status_function () {
     echo lamp status: show status of vm, site, apache2, mysql...
     echo
+}
+
+config_function () {
+    echo lamp config: opens configuration file
+}
+
+test_function () {
+    echo -e "${text_blue}doing test:${text_white}"
+    echo
+    resume_vm
 }
 
 # ==============================================================================================================================
@@ -278,36 +302,28 @@ case "${parameter1}" in
         start_function
         ;;
     "continue")
-        echo lamp continue: open editors and logs from current terminal
+        continue_function
         ;;
     "reload")
-        echo reloads apache2 on vm
+        reload_function
         ;;
     "restart")
-        if [ "$parameter2" = "web" ]; then
-            echo restarts apache2 on vm
-        else
-            echo reboots vm then start all necessary services
-        fi
+        restart_function
         ;;
     "stop")
-        if [ "$parameter2" = "vm" ]; then
-            echo shutdown vm host only
-        else
-            stop_function
-        fi
+        stop_function
         ;;
     "status")
         status_function
         ;;
     "config")
-        echo lamp config: opens configuration file
+        config_function
         ;;
     "test")
         test_function
         ;;
     *)
-        echo "${option} not recognised"
+        echo "argument not recognised"
         echo "
     lamp start: starts vm and all necessary services, then open appropriet editors, logs and sites
     lamp continue: open editors and logs from current terminal
