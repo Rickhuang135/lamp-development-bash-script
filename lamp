@@ -1,247 +1,325 @@
 #!/bin/bash
 
+# global variables not configurable in .conf file
 programename="lamp"
-option=$1
-numberofargs=$#
-# configpath="/usr/local/etc/$programename.conf"
+parameter1=$1
+parameter2=$2
 configpath="./$programename.conf"
-systemdservices=("apache2" "mysql")
+required_config_variables=("vm_domain" "vm_user" "vm_ip" "site" "terminal" "browser" "inputCssNames" "outputCssNames")
 
-findMagento() {
-    file="${1}/bin/magento"
-    if [ -f $file ]; then
-        systemdservices+=("elasticsearch")
-        echo magento module detected under ${1}
-        echo
-    fi
+# colors for text
+text_white="\e[0m"
+text_red="\e[31m"
+text_blue="\e[34m"
+text_yellow="\e[33m"
+
+# outline:
+#   input commands:
+#       lamp start: starts vm and all necessary services, then open appropriet editors, logs and sites 
+#       lamp continue: open editors and logs from current terminal
+#       lamp reload: reloads apache2 on vm
+#       lamp restart: reboots vm then start all necessary services
+#       lamp restart web: restart apache2 on vm
+#       lamp stop: shutdown vm and libvirtd, then close appropriet editors, logs and sites
+#       lamp stop vm: shutdown vm host only
+#       lamp status: show status of vm, site, apache2, mysql...
+#       lamp config: opens configuration file
+#      
+#       config required info: vm name, vm ip, to be enabled site name, web browser to use, terminal command
+#       automatically aquire info: whether vm is running, whether required systemd services are running
+
+
+# ==============================================================================================================================
+# configuration retrieval
+terminate_with_error () {
+    echo -e "${text_red}Program terminating with final error: \n${1} ${text_white}"
+    exit 1
 }
 
 retrieveConfig() {
     if [ -f $configpath ]; then
         source $configpath
-        IFS=',' read -r -a inputCssNames <<< "$inputNames"
-        IFS=',' read -r -a outputCssNames <<< "$outputNames"
-    else
-        echo config file not found
-        site="000-default"
-        browser="firefox"
-        inputCssNames=("input.css")
-        outputCssNames=("output.css" "main.css")
-    fi
-    sitetrimed=${site%%'.'*}
-    passed="true"
-    if [ -f "/etc/apache2/sites-available/$site.conf" ]; then
-        echo "apache2 file with top level domain found at"
-        apachesitefile="/etc/apache2/sites-available/$site.conf"
-    elif [ -f "/etc/apache2/sites-available/$sitetrimed.conf" ]; then
-        echo "apache2 file without top level domain found at"
-        apachesitefile="/etc/apache2/sites-available/$sitetrimed.conf"
-        site=$sitetrimed
-    else
-        passed="false"
-    fi
-    if [ "$passed" = "true" ]; then
-        echo $apachesitefile
-        echo
-        local directorytag=$(grep -i "Directory" "$apachesitefile")
-        local prefix=${directorytag%%'"'*}
-        local index=$(( ${#prefix} + 2 ))
-        local directorytagtrimed=$(echo $directorytag | cut -c$index-${#directorytag})
-
-        directory=${directorytagtrimed%%'"'*}
-        if ! test -d $directory; then
-            echo could not locate valid directory in apache2 site configuration file
-            if test -d "/var/www/$sitetrimed"; then
-                directory="var/www/$sitetrimed"
-                echo "using possible directory at $sitetrimed"
-                findMagento $directory
-            else
-                echo "no valid directory located, please check if the <Directory> tag is set corretly in $apachesitefile"
-                exit 1
+        local missing
+        missing=false
+        for var in "${required_config_variables[@]}"; do
+            if ! [[ -v $var ]]; then
+                echo -e "${text_red}variable '$var' is missing${text_white}"
+                local missing=true
             fi
-        else
-            findMagento $directory
+        done
+
+        if $missing; then
+            terminate_with_error "Config file is missing variables \nCheck 'required_config_variables' at the start of this script for all variables needed"
         fi
-    elif [ $numberofargs == 0 ]; then 
-        echo $site not found! make sure appropriet file exists in /etc/apache2/sites-available/ directory, or choose a different domain to open with "$programename config"
-        exit 1
-    elif [[ "$option" == "config" ]]; then
-        echo program is currently broken, site entry requires altering 
     else
-        echo $site not found! make sure appropriet file exists in /etc/apache2/sites-available/ directory, or choose a different domain to open with "$programename config"
-        exit 1
+        terminate_with_error "${programename} cannot run without the config file \nMake sure an appropriate path is assigned to the varaible 'configpath' at the start of this script$"
     fi
 }
 
 retrieveConfig
 
-starter() {
-    echo "start"
-    echo
+# ==============================================================================================================================
+# basic functions that don't rely on any other functions defined in the program
 
-    sudo a2ensite "$site.conf"
-    echo  
-
-    for k in "${systemdservices[@]}"
-    do
-        echo "starting ${k}"
-        sudo systemctl start "$k".service
-        echo
-    done
-
-    echo "opening vscode"
-    code $directory
-    echo  
-
-    gnome-terminal -- $programename continue
-}
-
-stopper() {
-    echo "stop"
-    echo
-    sudo a2dissite "$site.conf"
-    echo  
-
-    for k in "${systemdservices[@]}"
-    do
-        echo "stopping ${k}"
-        sudo systemctl stop "$k".service
-        echo
-    done
-
-    echo "killing processes"
-    local stringvaraible=`pgrep -f "$programename"`
-    local ifsparsablestring=`echo "$stringvaraible" | tr '\n' 'a'`
-    IFS='a' read -r -a array <<< "$ifsparsablestring"
-
-    for val in "${array[@]}";
-    do
-        echo "killing process: $val"
-        kill -9 $val
-    done
-    echo
-    echo "complete"
-}
-
-continuew() {
-    cd $directory
-    echo "opening browser"
-    $browser 127.0.0.1/ &
-    echo  
-
-    local findtailwindcss=$(find . -type f -name "tailwind.config.js")
-    if [ -z "$findtailwindcss" ]; then
-        tail -n 100 -f /var/log/apache2/error.log
-    else
-        echo "monitoring server for errors"
-        tail -n 100 -f /var/log/apache2/error.log &
-        echo  
-
-        for i in "${inputCssNames[@]}"
-        do
-            echo "searching for input file $i:"
-            local foundInputpath=`find . -type f -name "$i"`
-            if [ ! -z "$foundInputpath" ]; then
-            
-                local ifsparsablestring=`echo "$foundInputpath" | tr '\n' '+'`
-                IFS='+' read -r -a array <<< "$ifsparsablestring"
-                if [ ${#array[@]} == 1 ]; then
-                    echo "single input path found at ${array[0]}"
-                else
-                    echo "multiple input files found, please remove unnecessary"
-                    for val in "${array[@]}";
-                    do
-                        echo "exists array entry $val"
-                    done
-                    echo "defaulting to first path"
-                fi
-
-                for j in "${outputCssNames[@]}"
-                do
-                    echo "searching for output file $j"
-                    local foundOutputpath=`find . -type f -name "$j"`
-                    if [ ! -z "$foundOutputpath" ]; then
-                        local bah1=`echo "$foundOutputpath" | tr '\n' '+'`
-                        IFS='+' read -r -a array1 <<< "$bah1"
-                        if (( ${#array[@]} > 1 )); then
-                            echo "multiple output files found, this feature is currently not supported and only the first file found will be used"
-                        fi
-                        #build infrastructure in the future to support multiple output files
-                        #currently only the first command will be run.
-                        echo "output path found at ${array1[0]}"
-                        npx tailwindcss -i "${array[0]}" -o "${array1[0]}" --watch
-                    fi
-                done
-                
-                break
-            fi
-            echo  
-        done
+# "check_try_repeate" is for functions whose return value is not reflective of operation's result, needing to be tested against a seperate condition
+# "check_try_repeate" also expects the action to be critical, so failiure after the specified amount of tries will terminate the program
+# $1 is a condition function which returns a boolean
+# $2 is the action function to attempt if condition is not met. 
+# $3 is an integer that keeps track of the number of tries
+# $4 takes in the return message of the previous operation
+check_try_repeate () {
+    local condition_value
+    condition_value=$($1)
+    echo "trying $3"
+    if [ "$condition_value" = 1 ] ; then
+        echo 1
+    elif [ "$condition_value" = 0 ] ; then
+        if [ "$3" = 0 ] ; then
+            # echo 0;
+            terminate_with_error "$4"
+        else
+            local return_value
+            local remaining_tries=$(( $3 - 1))
+            return_value=$($2)
+            check_try_repeate "$1" "$2" "$remaining_tries" "$return_value"
+        fi
     fi
-
 }
 
-
-test() {
-    echo "this function is for testing purposes"
-
-    for k in "${systemdservices[@]}"
-    do
-        echo "$k"
-        echo
-    done
-}
-
-if [ $# == 0 ]; then
-    if [ -f "/etc/apache2/sites-enabled/$site.conf" ]; then
-        stopper
-    else
-        starter
-    fi
-else
-    case "${option}" in
-        "start")
-            starter
+# gives integer values for state of the vm, where:
+# value "1" means vm
+check_vm_domain () {
+    local state
+    state=$(sudo virsh domstate "$vm_domain")
+    case "${state}" in
+        "running")
+            echo 1
             ;;
-        "stop")
-            stopper
+        "paused")
+            echo 2
             ;;
-        "continue")
-            continuew
-            ;;
-        "test")
-            test
-            ;;
-        "status")
-            if [ -f "/etc/apache2/sites-enabled/$site.conf" ]; then
-                echo apache2 site is enabled
-            else
-                echo apache2 site is dissabled
-            fi
-            echo
-            echo running processes
-            pgrep -f -l "$programename" 
-            echo
-            
-            for k in "${systemdservices[@]}"
-            do
-                sudo systemctl status "$k".service
-                echo
-            done
-            ;;
-        "config")
-            echo "opening configuration file"
-            echo  
-            echo "available domains for apache2:"
-            ls /etc/apache2/sites-available
-            sudoedit "$configpath"
+        "shut off")
+            echo 0
             ;;
         *)
-            echo "${option} not recognised"
-            echo "run command without options to automatically turn on and off"
-            echo 'alternatively follow command with "start", "end", "status", or "config"'
-            echo  
-            echo "config  -  opens configuration file"
+            terminate_with_error "unexpected vm state '$state', exiting"
             ;;
     esac
-fi
+}
+
+#pass the service name as the $1 (first) argument
+check_systemd () {
+    local state
+    state=$(systemctl is-active "$1")
+    if [ "$state" = "active" ]; then
+        echo 1
+    else 
+        echo 0
+    fi
+}
+
+# ==============================================================================================================================
+# general functions
+
+# "resume_vm" ensures vm is unsuspended
+resume_vm () {
+    action_function () {
+        sudo virsh resume "$vm_domain"
+    }
+    condition_function () {
+        local condition_vm_state
+        condition_vm_state=$(check_vm_domain)
+        if [ "$condition_vm_state" = 1 ]; then
+            echo 1
+        else
+            echo 0
+        fi
+    }
+    action_function
+    check_try_repeate condition_function action_function 3
+}
+
+
+
+# "start_vm" ensures vm is running
+start_vm () {
+    local vm_state
+    vm_state=$(check_vm_domain)
+    if [ "$vm_state" = 0 ] ; then
+        action_function () {
+            sudo virsh start "$vm_domain"
+        }
+        action_function
+        check_try_repeate check_vm_domain action_function 3
+    else
+        if [ "$vm_state" = 2 ] ; then
+            echo -e "${text_yellow}vm was suspended, now resuming${text_white}"
+            sudo virsh resume "$vm_domain"
+        else
+            echo -e "${text_yellow}$vm_domain already running${text_white}"
+        fi
+    fi
+}
+
+# "start_libirtd" ensures libvirtd is running
+start_libvirtd () {
+    local libvirtd_state
+    libvirtd_state=$(check_systemd "libvirtd")
+    if [ "$libvirtd_state" = 0 ] ; then
+        echo starting libvirtd
+        action_function () {
+            sudo systemctl start libvirtd
+        }
+        condition_function () {
+            check_systemd libvirtd
+        }
+        action_function
+        check_try_repeate condition_function action_function 3
+    else
+        echo -e "${text_yellow}libvirtd.service is already running${text_white}"
+    fi
+}
+
+
+# "stop_vm" ensures vm is shut down gracefully
+stop_vm () {
+    local vm_state
+    vm_state=$(check_vm_domain)
+    if [ "$vm_state" = 0 ]; then
+        echo -e "${text_yellow}$vm_domain not running${text_white}"
+    else
+        if [ "$vm_state" = 2 ]; then
+            resume_vm
+        fi
+        action_function () {
+            echo "trying to stop vm"
+            sudo virsh shutdown "$vm_domain"
+        }
+        condition_function () {
+            local condition_vm_state
+            condition_vm_state=$(check_vm_domain)
+            if [ "$condition_vm_state" = 0 ]; then
+                echo 1
+            else
+                echo 0
+            fi
+        }
+        action_function
+        check_try_repeate condition_function action_function 3
+    fi
+}
+
+# "stop_libvirtd" ensures vm_domain is shutoff before stopping libvirtd.socket and libvirtd
+stop_libvirtd () {
+    local service
+    local service_state
+    service="libvirtd"
+    service_state=$(check_systemd $service)
+    if [ "$service_state" = 1 ]; then
+            echo "stopping libvirtd"
+            action_function() {
+                stop_vm
+                echo stopping libvirtd
+                sudo systemctl stop libvirtd.socket
+                sudo systemctl stop libvirtd
+            }
+            condition_function() {
+                local condition_service_state
+                condition_service_state=$(check_systemd "$service")
+                if [ "$condition_service_state" = 0 ]; then
+                    echo 1
+                else
+                    echo 0
+                fi
+            }
+            action_function
+            check_try_repeate condition_function action_function 3
+    else
+        echo -e "${text_yellow}libvirtd.service is not running${text_white}"
+    fi
+}
+
+
+
+
+
+# ==============================================================================================================================
+# parameter handlers
+
+test_function () {
+    echo -e "${text_blue}doing test:${text_white}"
+    echo
+    resume_vm
+}
+
+start_function () {
+    echo 'lamp start: starts vm and all necessary services, then open appropriet editors, logs and sites'
+    echo
+    start_libvirtd
+    start_vm
+}
+
+stop_function () {
+    echo "lamp stop: shutdown vm, then close appropriet editors, logs and sites"
+    echo
+    stop_libvirtd
+}
+
+status_function () {
+    echo lamp status: show status of vm, site, apache2, mysql...
+    echo
+}
+
+# ==============================================================================================================================
+# checking for paramenters
+
+case "${parameter1}" in
+    "start")
+        start_function
+        ;;
+    "continue")
+        echo lamp continue: open editors and logs from current terminal
+        ;;
+    "reload")
+        echo reloads apache2 on vm
+        ;;
+    "restart")
+        if [ "$parameter2" = "web" ]; then
+            echo restarts apache2 on vm
+        else
+            echo reboots vm then start all necessary services
+        fi
+        ;;
+    "stop")
+        if [ "$parameter2" = "vm" ]; then
+            echo shutdown vm host only
+        else
+            stop_function
+        fi
+        ;;
+    "status")
+        status_function
+        ;;
+    "config")
+        echo lamp config: opens configuration file
+        ;;
+    "test")
+        test_function
+        ;;
+    *)
+        echo "${option} not recognised"
+        echo "
+    lamp start: starts vm and all necessary services, then open appropriet editors, logs and sites
+    lamp continue: open editors and logs from current terminal
+    lamp reload: reloads apache2 on vm
+    lamp restart: reboots vm then start all necessary services
+    lamp restart web: restart apache2 on vm
+    lamp stop: shutdown vm, then close appropriet editors, logs and sites
+    lamp stop vm: shutdown vm host only
+    lamp status: show status of vm, site, apache2, mysql...
+    lamp config: opens configuration file"
+        ;;
+esac
+
+# ==============================================================================================================================
+# end of script
