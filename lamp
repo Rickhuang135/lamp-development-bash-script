@@ -1,11 +1,17 @@
 #!/bin/bash
 
+     
+# config required info: vm name, vm ip, to be enabled site name, web browser to use, terminal command
+# automatically aquire info: whether vm is running, whether required systemd services are running
+
 # global variables not configurable in .conf file
 programename="lamp"
 parameter1=$1
 parameter2=$2
+parameter3=$3
 configpath="./$programename.conf"
-required_config_variables=("vm_domain" "vm_user" "vm_ip" "site" "terminal" "browser" "inputCssNames" "outputCssNames")
+required_config_variables=("vm_domain" "vm_user" "vm_ip" "vm_network_name" "site" "terminal" "browser" "inputCssNames" "outputCssNames")
+remote_systemd_services=("apache2" "mysql")
 
 # special codes for text
 text_white="\e[0m"
@@ -15,31 +21,214 @@ text_yellow="\e[33m"
 text_green="\e[32m"
 line_clear="\033[0K\r"
 
-
-# outline:
-#   input commands:
-#       lamp start: starts vm and all necessary services, then open appropriet editors, logs and sites 
-#       lamp continue: open editors and logs from current terminal
-#       lamp reload: reloads apache2 on vm
-#       lamp restart: reboots vm then start all necessary services
-#       lamp restart web: restart apache2 on vm
-#       lamp stop: shutdown vm and libvirtd, then close appropriet editors, logs and sites
-#       lamp stop vm: shutdown vm host only
-#       lamp status: show status of vm, site, apache2, mysql...
-#       lamp config: opens configuration file
-#      
-#       config required info: vm name, vm ip, to be enabled site name, web browser to use, terminal command
-#       automatically aquire info: whether vm is running, whether required systemd services are running
-
-
 # ==============================================================================================================================
-# configuration retrieval
+# essential functions, those used by nearly every part of the program 
+
 terminate_with_error () {
     echo -e "${text_red}Program terminating with final error: \n${1} ${text_white}"
     exit 1
 }
 
-retrieveConfig() {
+# "check_wait_repeate" is for checking a condition repeatedly at specified intervals, inorder to ensure a command has fully completed
+# $1 is the condition function
+# $2 is the timeout interval
+# $3 is the number of timeouts
+check_wait_repeate () {
+    sleep "$2"
+    local condition_value
+    condition_value=$($1)
+    if [ "$condition_value" = 1 ] ; then
+        echo -e "${line_clear}${text_green}completed${text_white}                  \n"
+    elif [ "$condition_value" = 0 ] ; then
+        if [ "$3" = 0 ] ; then
+            echo -e "${line_clear}${text_red}timed out${text_white}                 \n";
+            terminate_with_error "condition not met"
+        else
+            local time_remaining
+            time_remaining=$(python3 -c "print(round(${2} * ${3}, 1))")
+            echo -en "${line_clear}${time_remaining} seconds until timeout"
+            local remaining_intervals=$(( $3 - 1 ))
+            check_wait_repeate "$1" "$2" "$remaining_intervals"
+        fi
+    fi
+}
+# ==============================================================================================================================
+# remote operations to be done over ssh on the vm
+
+# pass the service name as the $1 (first) argument
+check_systemd () {
+    local state
+    state=$(systemctl is-active "$1")
+    if [ "$state" = "active" ]; then
+        echo 1
+    else 
+        echo 0
+    fi
+}
+
+# $parameter1 is the remote command
+# $parameter2 describes the action to be taken
+# $parameter3 is a concatinated string containing config information,
+# i.e "site=placeholder.com inputCssNames=input.css outputCssNames=output.css,main.css"
+remote_function () {
+
+    # "single_out" determines if multiple entries exist, then returns one result
+    # $1 is the string to be parsed
+    # $2 is the IFS seperator used to identify the number of entries
+    single_out () {
+        local bah1
+        bah1=$(echo "$1" | tr "$2" ' ')
+        IFS=' ' read -r -a array1 <<< "$bah1"
+        echo "${array1[0]}"
+    }
+
+    # "check_site" returns a boolean representing whether a site is enabled assuming it exists
+    # $1 is the exact site name
+    check_site () {
+        local response
+        response=$(sudo a2query -s | grep "$exact_site")
+        if [ -z "$response" ] ; then
+            echo 0
+        else
+            echo 1
+        fi
+    }
+
+    # "$spread_config" parses $parameter3 to create the appropriet global variables
+    spread_config () {
+        IFS=' ' read -r -a config_array <<< "$parameter3"
+        
+        for entry in "${config_array[@]}";
+        do
+            local config_name
+            config_name=${entry%%'='*}
+            local cut_index
+            cut_index=$(( ${#config_name} + 2 ))
+            local config_value
+            config_value=$(echo "$entry" | cut -c"$cut_index"-${#entry})
+            case "$config_name" in
+                "site")
+                    site=$config_value
+                    ;;
+                "inputCssNames")
+                    IFS=',' read -r -a inputCssArray <<< "$config_value"
+                    ;;
+                "outputCssNames")
+                    IFS=',' read -r -a outputCssArray <<< "$config_value"
+                    ;;
+            esac
+        done
+    }
+    spread_config
+
+    local apache2_path;
+    apache2_path="/etc/apache2/sites-available/"
+    local find_site
+    find_site=$(find ${apache2_path} -name "*${site}*")
+    local apache_site_file
+    apache_site_file=$(single_out "$find_site" "\n")
+
+    if [ -z "$apache_site_file" ]; then
+        terminate_with_error "$site not found! make sure appropriet file exists in $apache2_path directory on the vm, or choose a different domain to open with '$programename config'"
+    fi
+
+    local exact_site
+    exact_site=${apache_site_file#"$apache2_path"}
+    exact_site=${exact_site%%'.conf'}
+    
+
+    case "$parameter2" in
+        "start")
+            if [ "$(check_site)" = 1 ]; then
+                echo -e "${text_yellow}site '$exact_site' is already active${text_white}"
+            else 
+                echo "enabling $exact_site"
+                sudo a2ensite "$exact_site" > /dev/null 2>&1
+                check_wait_repeate check_site 0.2 5
+                if [ "$(check_systemd apache2)" = 1 ]; then
+                    sudo systemctl reload apache2
+                fi
+            fi
+            for k in "${remote_systemd_services[@]}"
+            do
+                local systemd_state
+                systemd_state=$(check_systemd "$k")
+                if [ "$systemd_state" = 1 ]; then
+                    echo -e "${text_yellow}${k}.service is already enabled${text_white}"
+                else
+                    echo "starting ${k}.service"
+                    sudo systemctl start "$k"
+                    condition_function () {
+                        check_systemd "$k"
+                    }
+                    check_wait_repeate condition_function 0.5 10
+                fi
+            done
+            ;;
+        "stop")
+            if [ "$(check_site)" = 1 ]; then
+                echo "disablling $exact_site"
+                sudo a2dissite "$exact_site" > /dev/null 2>&1
+                condition_function () {
+                    local status
+                    status=$(( 1 - $(check_site) ))
+                    echo $status
+                }
+                check_wait_repeate condition_function 0.2 5
+            else 
+                echo -e "${text_yellow}site '$exact_site' is already disabled${text_white}"
+            fi
+            for k in "${remote_systemd_services[@]}"
+            do
+                local systemd_state
+                systemd_state=$(check_systemd "$k")
+                if [ "$systemd_state" = 1 ]; then
+                    echo "stopping ${k}.service"
+                    sudo systemctl stop "$k"
+                    condition_function () {
+                        local status
+                        status=$(( 1 - $(check_systemd "$k") ))
+                        echo $status
+                    }
+                    check_wait_repeate condition_function 0.5 5
+                else
+                    echo -e "${text_yellow}${k}.service is inactive${text_white}"
+                fi
+            done
+            ;;
+        "status")
+            if [ "$(check_site)" = 1 ]; then
+                echo -e "${text_green}site '$exact_site' is active${text_white}"
+            else 
+                echo -e "${text_red}site '$exact_site' is dissable${text_white}"
+            fi
+            for k in "${remote_systemd_services[@]}"
+            do
+                local systemd_state
+                systemd_state=$(check_systemd "$k")
+                if [ "$systemd_state" = 1 ]; then
+                    echo -e "${text_green}${k}.service is active${text_white}"
+                else
+                    echo -e "${text_red}${k}.service is inactive${text_white}"
+                fi
+            done
+            ;;
+        *)
+         echo instruction unclear
+         ;;
+    esac
+}
+
+
+# ==============================================================================================================================
+# configuration retrieval and editing
+config_function () {
+    echo lamp config: opens configuration file
+    echo
+    sudoedit "$configpath"
+}
+
+retrieveLocalConfig() {
     if [ -f $configpath ]; then
         source $configpath
         local missing
@@ -52,40 +241,39 @@ retrieveConfig() {
         done
 
         if $missing; then
-            terminate_with_error "Config file is missing variables \nCheck 'required_config_variables' at the start of this script for all variables needed"
+            if [ "$parameter1" = "config" ]; then
+                config_function
+                exit 0
+            else
+                terminate_with_error "Config file is missing variables \nCheck 'required_config_variables' at the start of this script for all variables needed"
+            fi
         fi
+
+        script_location="$(pwd)/${programename}"
     else
-        terminate_with_error "${programename} cannot run without the config file \nMake sure an appropriate path is assigned to the varaible 'configpath' at the start of this script$"
+        case "${parameter1}" in
+            "remote")
+                remote_function
+                exit 0
+                ;;
+            "config")
+                config_function
+                exit 0
+                ;;
+            *)
+                terminate_with_error "${programename} cannot run without the config file \nMake sure an appropriate path is assigned to the varaible 'configpath' at the start of this script$"
+                ;;
+        esac
     fi
 }
 
-retrieveConfig
+retrieveLocalConfig
 
 # ==============================================================================================================================
 # basic functions that don't rely on any other functions defined in the program
 
-# "check_wait_repeate" is for checking a condition repeatedly at specified intervals, inorder to ensure a command has fully completed
-# $1 is the condition function
-# $2 is the timeout interval
-# $3 is the number of timeouts
-check_wait_repeate () {
-    sleep "$2"
-    local condition_value
-    condition_value=$($1)
-    if [ "$condition_value" = 1 ] ; then
-        echo -e "${line_clear}${text_green}completed${text_white}                \n"
-    elif [ "$condition_value" = 0 ] ; then
-        if [ "$3" = 0 ] ; then
-            echo -e "${line_clear}${text_red}timed out${text_white}               \n";
-            terminate_with_error "condition not met"
-        else
-            local time_remaining
-            time_remaining=$(python3 -c "print(round(${2} * ${3}, 1))")
-            echo -en "${line_clear}${time_remaining} seconds until timeout"
-            local remaining_intervals=$(( $3 - 1 ))
-            check_wait_repeate "$1" "$2" "$remaining_intervals"
-        fi
-    fi
+concatinate_config () {
+    echo "'site=${site} inputCssNames=${inputCssNames} outputCssNames=${outputCssNames}'"
 }
 
 # gives integer values for state of the vm, where:
@@ -109,13 +297,34 @@ check_vm_domain () {
     esac
 }
 
-#pass the service name as the $1 (first) argument
-check_systemd () {
-    local state
-    state=$(systemctl is-active "$1")
-    if [ "$state" = "active" ]; then
+# "check_ping" more accurately checks whether a vm is fully running
+check_ping () {
+    local ping_result
+    ping_result=$(ping -c 1 $vm_ip)
+    if [[ "$ping_result" =~ "time=" ]] && [[ "$ping_result" =~ "1 received" ]]; then
         echo 1
-    else 
+    else
+        echo 0
+    fi
+}
+
+# ssh into vm host
+ssh_vm () {
+    echo "checking ${vm_ip}'s network status"
+    check_wait_repeate check_ping 1 8
+    sleep 1
+    local important_string
+    important_string=$(concatinate_config)
+    ssh "${vm_user}@${vm_ip}" 'bash -s' < "$script_location" "remote $1 $important_string"
+}
+
+# "find_net_status" determines the state of a vm network, where on is 1, off is 0
+find_net_status () {
+    local network_status
+    network_status=$(sudo virsh net-info "$vm_network_name" | grep Active)
+    if [[ "$network_status" =~ "yes" ]]; then
+        echo 1
+    else
         echo 0
     fi
 }
@@ -150,7 +359,7 @@ start_vm () {
     else
         if [ "$vm_state" = 2 ] ; then
             echo -e "${text_yellow}vm was suspended, now resuming${text_white}"
-            sudo virsh resume "$vm_domain"
+            resume_vm
         else
             echo -e "${text_yellow}$vm_domain already running${text_white}"
         fi
@@ -170,6 +379,31 @@ start_libvirtd () {
         check_wait_repeate condition_function 0.2 3
     else
         echo -e "${text_yellow}libvirtd.service is already running${text_white}"
+    fi
+}
+
+# "start_vm_net" ensures that the virtual network (bridge) that the vm depends on is active"
+start_vm_net () {
+    if [ "$(find_net_status)" = 0 ]; then
+        sudo virsh net-start "$vm_network_name"
+        check_wait_repeate find_net_status 0.1 5
+    else
+        echo -e "${text_yellow}virtual network ${vm_network_name} is already active${text_white}"
+    fi
+}
+
+# "stop_vm_net" ensures that the virtual network (bridge) is destroyed
+stop_vm_net () {
+    find_net_status_invert () {
+        local status
+        status=$(( 1 - $(find_net_status) ))
+        echo $status
+    }
+    if [ "$(find_net_status)" = 1 ]; then
+        sudo virsh net-destroy "$vm_network_name"
+        check_wait_repeate find_net_status_invert 0.1 5
+    else
+        echo -e "${text_yellow}virtual network ${vm_network_name} is not active${text_white}"
     fi
 }
 
@@ -206,6 +440,7 @@ stop_libvirtd () {
     service_state=$(check_systemd $service)
     if [ "$service_state" = 1 ]; then
             stop_vm
+            stop_vm_net
             echo stopping libvirtd
             sudo systemctl stop libvirtd.socket
             sudo systemctl stop libvirtd
@@ -225,22 +460,24 @@ stop_libvirtd () {
 }
 
 
-
-
-
 # ==============================================================================================================================
 # parameter handlers
-
 
 start_function () {
     echo 'lamp start: starts vm and all necessary services, then open appropriet editors, logs and sites'
     echo
     start_libvirtd
+    start_vm_net
     start_vm
+    if [ -z "$parameter2" ]; then
+        ssh_vm start
+    fi
 }
 
 continue_function () {
     echo lamp continue: open editors and logs from current terminal
+    echo 
+    code --remote "ssh-remote+${vm_user}@${vm_ip}" /var/www/html/magento2
 }
 
 reload_function () {
@@ -248,7 +485,7 @@ reload_function () {
 }
 
 restart_function () {
-    if [ "$parameter2" = "web" ]; then
+    if [ "$parameter2" = "server" ]; then
         echo restarts apache2 on vm
     else
         echo "reboots vm then start all necessary services"
@@ -256,8 +493,10 @@ restart_function () {
 }
 
 stop_function () {
-    if [ "$parameter2" = "vm" ]; then
-            echo shutdown vm host only
+    if [ "$parameter2" = "server" ]; then
+            echo shutdown services on vm only
+            echo
+            ssh_vm stop
     else
         echo "lamp stop: shutdown vm, then close appropriet editors, logs and sites"
         echo
@@ -268,18 +507,51 @@ stop_function () {
 status_function () {
     echo lamp status: show status of vm, site, apache2, mysql...
     echo
-}
-
-config_function () {
-    echo lamp config: opens configuration file
+    local libvirtd_state
+    libvirtd_state=$(check_systemd libvirtd)
+    if [ "$libvirtd_state" = 1 ]; then
+        echo -e "${text_green}libvirtd is running${text_white}"
+        if [ "$(find_net_status)" = 1 ]; then
+            echo -e "${text_green}virtual network ${vm_network_name} is active${text_white}"
+            case $(check_vm_domain) in
+                "1")
+                    echo -e "${text_green}vm domain ${vm_domain} is running${text_white}"
+                    ssh_vm status
+                    ;;
+                "2")
+                    echo -e "${text_yellow}vm domain ${vm_domain} is suspended${text_white}"
+                    ;;
+                "0")
+                    echo -e "${text_red}vm domain ${vm_domain} is shutoff${text_white}"
+                    ;;
+            esac
+        else
+            echo -e "${text_red}virtual network ${vm_network_name} is inactive${text_white}"
+        fi
+    else
+        echo -e "${text_red}libvirtd is inactive${text_white}"
+    fi
 }
 
 test_function () {
     echo -e "${text_blue}doing test:${text_white}"
-    condition_function(){
-        echo 0
+
+    # "single_out" determines if multiple entries exist, then returns one result
+    # $1 is the string to be parsed
+    # $2 is the IFS seperator used to identify the number of entries
+    single_out () {
+        local bah1
+        bah1=$(echo "$1" | tr "$2" ' ')
+        IFS=' ' read -r -a array1 <<< "$bah1"
+        if (( ${#array1[@]} > 1 )); then
+            echo "multiple files found"
+        fi
+        echo "${array1[0]}"
     }
-    check_wait_repeate condition_function 0.5 5
+    local find_result   
+    find_result=$(find . -name "*lamp*")
+    single_out "$find_result" '\n'
+    
 }
 
 # ==============================================================================================================================
@@ -317,9 +589,9 @@ case "${parameter1}" in
     lamp continue: open editors and logs from current terminal
     lamp reload: reloads apache2 on vm
     lamp restart: reboots vm then start all necessary services
-    lamp restart web: restart apache2 on vm
+    lamp restart server: restart apache2 on vm
     lamp stop: shutdown vm, then close appropriet editors, logs and sites
-    lamp stop vm: shutdown vm host only
+    lamp stop server: only stops services on vm
     lamp status: show status of vm, site, apache2, mysql...
     lamp config: opens configuration file"
         ;;
