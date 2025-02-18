@@ -439,6 +439,7 @@ stop_libvirtd () {
     service="libvirtd"
     service_state=$(check_systemd $service)
     if [ "$service_state" = 1 ]; then
+            ssh_vm stop
             stop_vm
             stop_vm_net
             echo stopping libvirtd
