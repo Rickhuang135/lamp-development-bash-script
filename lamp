@@ -52,6 +52,23 @@ check_wait_repeate () {
         fi
     fi
 }
+
+# "$spread_values" parses concatinated input to create the appropriet global variables
+# $1 is the input
+# $2 is the assignment function, into which each entry is passed
+    spread_values () {
+        IFS=' ' read -r -a config_array <<< "$1"
+        
+        for entry in "${config_array[@]}";
+        do
+            local parameter_name
+            parameter_name=${entry%%'='*}
+            local argument_value
+            argument_value=$(( ${#parameter_name} + 2 ))
+            argument_value=$(echo "$entry" | cut -c"$argument_value"-${#entry})
+            $2 "$parameter_name" "$argument_value"
+        done
+    }
 # ==============================================================================================================================
 # remote operations to be done over ssh on the vm
 
@@ -94,32 +111,30 @@ remote_function () {
         fi
     }
 
-    # "$spread_config" parses $parameter3 to create the appropriet global variables
-    spread_config () {
-        IFS=' ' read -r -a config_array <<< "$parameter3"
-        
-        for entry in "${config_array[@]}";
-        do
-            local config_name
-            config_name=${entry%%'='*}
-            local cut_index
-            cut_index=$(( ${#config_name} + 2 ))
-            local config_value
-            config_value=$(echo "$entry" | cut -c"$cut_index"-${#entry})
-            case "$config_name" in
-                "site")
-                    site=$config_value
-                    ;;
-                "inputCssNames")
-                    IFS=',' read -r -a inputCssArray <<< "$config_value"
-                    ;;
-                "outputCssNames")
-                    IFS=',' read -r -a outputCssArray <<< "$config_value"
-                    ;;
-            esac
-        done
+    #"find_magento" determines if the apache2 site uses magento
+    find_magento() {
+        file="${1}/bin/magento"
+        if [ -f "$file" ]; then
+            echo magento module detected under "${1}"
+            echo
+        fi
     }
-    spread_config
+
+    # parameter_name is passed into $1, and argument_value is passed into $2
+    assignment_function () {
+        case "$1" in
+            "site")
+                site=$2
+                ;;
+            "inputCssNames")
+                IFS=',' read -r -a inputCssArray <<< "$2"
+                ;;
+            "outputCssNames")
+                IFS=',' read -r -a outputCssArray <<< "$2"
+                ;;
+        esac
+    }
+    spread_values "$parameter3" assignment_function
 
     local apache2_path;
     apache2_path="/etc/apache2/sites-available/"
@@ -132,15 +147,70 @@ remote_function () {
         terminate_with_error "$site not found! make sure appropriet file exists in $apache2_path directory on the vm, or choose a different domain to open with '$programename config'"
     fi
 
+    local directory
+    directory=$(grep -i "Directory" "$apache_site_file")
+    local prefix
+    prefix=${directory%%'"'*}
+    prefix=$(( ${#prefix} + 2 ))
+    directory=$(echo "$directory" | cut -c$prefix-${#directory})
+    directory=${directory%%'"'*}
+
+    if ! test -d "$directory"; then
+        echo -e "${text_red}could not locate valid directory in apache2 site configuration file${text_white}"
+    else
+        local remote_paths
+
+        # find_magento needs to happen before the switch statement because it may add "elasticsearch" to "remote_systemd_services"
+        local find_magento_result
+        find_magento_result=$(find_magento "$directory")
+
+        local findtailwindcss
+        findtailwindcss=$(find . -type f -name "tailwind.config.js")
+
+        if [ -n "$find_magento_result" ]; then
+            echo "$find_magento_result"
+            remote_systemd_services+=("elasticsearch")
+            remote_paths="{remote_paths}working_directory=${directory}"
+
+        elif [ -n "$findtailwindcss" ]; then
+            echo "tailwind CSS configuration file found under ${directory}"
+            # searches for input and output files of tailwind css
+            local inputCssPath
+            local outputCssPath
+            for i in "${inputCssArray[@]}"
+            do
+                echo -n "searching for input file $i:"
+                inputCssPath=$(find . -type f -name "$i")
+                if [ -n "$inputCssPath" ]; then
+                    inputCssPath=$(single_out "$inputCssPath" "\n")
+                    echo -e "${text_green}input path found at $inputCssPath${text_white}    "
+                    for j in "${outputCssArray[@]}"
+                    do
+                        echo -n "searching for output file $j"
+                        local outputCssPath
+                        outputCssPath=$(find . -type f -name "$j")
+                        if [ -n "$outputCssPath" ]; then
+                            outputCssPath=$(single_out "$outputCssPath")
+                            echo -e "${text_green}output path found at $outputCssPath${text_white}    "
+                            break
+                        fi
+                    done
+                    break
+                fi
+                echo
+            done
+            remote_paths="{remote_paths}working_directory=${directory} inputCssPath=${inputCssPath} outputCssPath=${outputCssPath}"
+        fi
+    fi
+
     local exact_site
     exact_site=${apache_site_file#"$apache2_path"}
     exact_site=${exact_site%%'.conf'}
     
-
     case "$parameter2" in
         "start")
             if [ "$(check_site)" = 1 ]; then
-                echo -e "${text_yellow}site '$exact_site' is already active${text_white}"
+                echo -e "${text_yellow}site '$exact_site' is already enabled${text_white}"
             else 
                 echo "enabling $exact_site"
                 sudo a2ensite "$exact_site" > /dev/null 2>&1
@@ -154,7 +224,7 @@ remote_function () {
                 local systemd_state
                 systemd_state=$(check_systemd "$k")
                 if [ "$systemd_state" = 1 ]; then
-                    echo -e "${text_yellow}${k}.service is already enabled${text_white}"
+                    echo -e "${text_yellow}${k}.service is already active${text_white}"
                 else
                     echo "starting ${k}.service"
                     sudo systemctl start "$k"
@@ -164,6 +234,9 @@ remote_function () {
                     check_wait_repeate condition_function 0.5 10
                 fi
             done
+
+            # appropriet directories sent back to host
+            echo "$remote_paths"
             ;;
         "stop")
             if [ "$(check_site)" = 1 ]; then
@@ -471,7 +544,18 @@ start_function () {
     start_vm_net
     start_vm
     if [ -z "$parameter2" ]; then
-        ssh_vm start
+        # assignment_function () {
+
+        # }
+        local output
+        output=$(ssh_vm start)
+        local remote_paths
+        remote_paths=$(echo "$output" | grep "{remote_paths}")
+        #currently not editing output properly, get it to cut off everything after {remote_paths}
+        output=${output%%'{remote_paths}'*}
+        echo "$output"
+        remote_paths=${remote_paths#"{remote_paths}"}
+        echo $remote_paths
     fi
 }
 
@@ -536,22 +620,6 @@ status_function () {
 
 test_function () {
     echo -e "${text_blue}doing test:${text_white}"
-
-    # "single_out" determines if multiple entries exist, then returns one result
-    # $1 is the string to be parsed
-    # $2 is the IFS seperator used to identify the number of entries
-    single_out () {
-        local bah1
-        bah1=$(echo "$1" | tr "$2" ' ')
-        IFS=' ' read -r -a array1 <<< "$bah1"
-        if (( ${#array1[@]} > 1 )); then
-            echo "multiple files found"
-        fi
-        echo "${array1[0]}"
-    }
-    local find_result   
-    find_result=$(find . -name "*lamp*")
-    single_out "$find_result" '\n'
     
 }
 
