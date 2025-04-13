@@ -9,7 +9,7 @@ programename="lamp"
 parameter1=$1
 parameter2=$2
 parameter3=$3
-configpath="./$programename.conf"
+configpath="/etc/$programename.conf"
 required_config_variables=("vm_domain" "vm_user" "vm_ip" "vm_network_name" "site" "terminal" "browser" "inputCssNames" "outputCssNames")
 remote_systemd_services=("apache2" "mysql")
 
@@ -338,7 +338,7 @@ retrieveLocalConfig() {
             fi
         fi
 
-        script_location="$(pwd)/${programename}"
+        script_location="$(which $programename)"
     else
         case "${parameter1}" in
             "remote")
